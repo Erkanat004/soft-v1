@@ -179,8 +179,15 @@ export const SettingsPage: React.FC = () => {
 
             {/* Fields */}
             <div className="space-y-3">
+              {(p.provider_name === 'local_cards' || p.provider_name === 'windows_tts') && (
+                <p className="text-xs text-amber-300">
+                  {p.provider_name === 'local_cards'
+                    ? 'Локальные карточки по описанию сцены: бесплатно, без AI-иллюстраций и без ключа.'
+                    : 'Озвучка установленными голосами Windows: бесплатно и без ключа.'}
+                </p>
+              )}
               {/* API Key Input */}
-              <div className="space-y-1">
+              {p.provider_name !== 'local_cards' && p.provider_name !== 'windows_tts' && <div className="space-y-1">
                 <div className="flex justify-between items-center text-xs text-slate-400">
                   <span className="flex items-center gap-1">
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
@@ -195,9 +202,15 @@ export const SettingsPage: React.FC = () => {
                   onChange={(e) => setKeyInputs({ ...keyInputs, [p.provider_name]: e.target.value })}
                   className="w-full bg-dark-900 border border-dark-700 rounded-xl px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:border-purple-500"
                 />
-              </div>
+              </div>}
 
               {/* Editable Model ID */}
+              {p.provider_name.startsWith('gemini') && (
+                <p className="text-xs text-slate-400">
+                  Если прежняя модель недоступна, укажите <strong>auto</strong> и нажмите Save.
+                  Доступная модель будет определяться через API; квоты провайдера сохраняются.
+                </p>
+              )}
               <div className="space-y-1">
                 <label className="text-xs text-slate-400">Model ID</label>
                 <input
@@ -207,7 +220,7 @@ export const SettingsPage: React.FC = () => {
                     const updated = { ...p, model_id: e.target.value };
                     setProviders(providers.map(pr => pr.id === p.id ? updated : pr));
                   }}
-                  placeholder="e.g. gpt-4o, gemini-2.5-flash"
+                  placeholder={p.provider_name.startsWith('gemini') ? 'auto — доступная модель Gemini' : 'Model ID'}
                   className="w-full bg-dark-900 border border-dark-700 rounded-xl px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:border-purple-500"
                 />
               </div>
@@ -247,7 +260,7 @@ export const SettingsPage: React.FC = () => {
               )}
 
               {/* Remember Key Checkbox */}
-              <div className="flex items-center gap-2 pt-1">
+              {p.provider_name !== 'local_cards' && p.provider_name !== 'windows_tts' && <div className="flex items-center gap-2 pt-1">
                 <input
                   type="checkbox"
                   id={`rem_${p.provider_name}`}
@@ -258,7 +271,7 @@ export const SettingsPage: React.FC = () => {
                 <label htmlFor={`rem_${p.provider_name}`} className="text-xs text-slate-400">
                   Remember API Key in Windows Credential Manager
                 </label>
-              </div>
+              </div>}
             </div>
 
             {/* Card Footer Actions */}

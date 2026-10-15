@@ -1,9 +1,64 @@
 import axios from 'axios';
 import { Project, Script, Scene, Character, Location, ProviderSetting, Job, FFmpegStatus } from './types';
 
+export interface ReferenceAnalysis {
+  duration_seconds: number;
+  width: number;
+  height: number;
+  analyzed_seconds: number;
+  detected_cuts: number;
+  cuts_per_minute: number;
+  pace: string;
+  cut_times: number[];
+  cut_detection_available: boolean;
+}
+
+export interface NicheAnalysis {
+  sample_size: number;
+  median_views_per_day: number;
+  ranked_videos: { title: string; views: number; age_days: number; views_per_day: number; relative_to_median: number | null }[];
+}
+
+export interface LocalPreflight {
+  ffmpeg_ready: boolean;
+  ffprobe_ready: boolean;
+  storage_ready: boolean;
+  windows_voice_ready: boolean;
+  free_disk_gb: number;
+  text_key_configured: boolean;
+  external_api_calls_made: boolean;
+}
+
 const API_BASE = '/api';
 
+export function apiErrorMessage(error: unknown, fallback = 'Не удалось выполнить действие'): string {
+  if (axios.isAxiosError(error)) {
+    const detail = error.response?.data?.detail;
+    if (typeof detail === 'string') return detail;
+    if (!error.response) return 'Нет связи с сервером. Проверьте, запущен ли backend.';
+  }
+  return fallback;
+}
+
 export const api = {
+  downloadBackup: async (): Promise<Blob> => {
+    const response = await axios.post(`${API_BASE}/backup/export`, {}, { responseType: 'blob', timeout: 300000 });
+    return response.data;
+  },
+  getLocalPreflight: async (): Promise<LocalPreflight> => {
+    const response = await axios.get(`${API_BASE}/settings/preflight`, { timeout: 30000 });
+    return response.data;
+  },
+  analyzeReference: async (file: File): Promise<ReferenceAnalysis> => {
+    const form = new FormData();
+    form.append('file', file);
+    const response = await axios.post(`${API_BASE}/research/reference-video`, form, { timeout: 150000 });
+    return response.data;
+  },
+  analyzeNiche: async (videos: { title: string; views: number; age_days: number }[]): Promise<NicheAnalysis> => {
+    const response = await axios.post(`${API_BASE}/research/niche`, { videos });
+    return response.data;
+  },
   // Projects
   listProjects: async (): Promise<Project[]> => {
     const res = await axios.get(`${API_BASE}/projects`);
@@ -21,11 +76,18 @@ export const api = {
     language?: string;
     story_type?: string;
     visual_style?: string;
+    creative_brief?: string;
     active_text_provider?: string;
     active_image_provider?: string;
     active_tts_provider?: string;
+    aspect_ratio?: string;
+    resolution?: string;
   }): Promise<Project> => {
     const res = await axios.post(`${API_BASE}/projects`, payload);
+    return res.data;
+  },
+  createTestProject: async (): Promise<Project> => {
+    const res = await axios.post(`${API_BASE}/projects/create-test`);
     return res.data;
   },
   updateProject: async (id: string, payload: Partial<Project>): Promise<Project> => {
@@ -35,16 +97,37 @@ export const api = {
   deleteProject: async (id: string): Promise<void> => {
     await axios.delete(`${API_BASE}/projects/${id}`);
   },
-  clearAllProjects: async (): Promise<void> => {
-    await axios.delete(`${API_BASE}/projects`);
+  clearAllProjects: async (): Promise<{ media_cleanup_warnings?: string[] }> => {
+    const res = await axios.delete(`${API_BASE}/projects`);
+    return res.data;
   },
-  triggerAutoPipeline: async (id: string): Promise<Job> => {
-    const res = await axios.post(`${API_BASE}/projects/${id}/generate`);
+  triggerAutoRemaining: async (id: string): Promise<Job> => {
+    const res = await axios.post(`${API_BASE}/projects/${id}/auto-remaining`);
+    return res.data;
+  },
+  triggerBatchTTS: async (id: string): Promise<Job> => {
+    const res = await axios.post(`${API_BASE}/projects/${id}/batch-tts`);
+    return res.data;
+  },
+  triggerBatchImages: async (id: string): Promise<Job> => {
+    const res = await axios.post(`${API_BASE}/projects/${id}/batch-images`);
+    return res.data;
+  },
+  triggerBatchClips: async (id: string): Promise<Job> => {
+    const res = await axios.post(`${API_BASE}/projects/${id}/batch-clips`);
+    return res.data;
+  },
+  exportProject: async (id: string): Promise<{ message: string; video_path: string }> => {
+    const res = await axios.post(`${API_BASE}/projects/${id}/export`);
+    return res.data;
+  },
+  getRenderStatus: async (id: string): Promise<{ exists: boolean; current: boolean }> => {
+    const res = await axios.get(`${API_BASE}/projects/${id}/render/status`);
     return res.data;
   },
 
   // Script
-  getScript: async (projectId: string): Promise<Script> => {
+  getScript: async (projectId: string): Promise<Script | null> => {
     const res = await axios.get(`${API_BASE}/projects/${projectId}/script`);
     return res.data;
   },
@@ -56,22 +139,71 @@ export const api = {
     const res = await axios.post(`${API_BASE}/projects/${projectId}/script/enhance?instruction=${encodeURIComponent(instruction)}`);
     return res.data;
   },
+  decomposeScenes: async (projectId: string): Promise<Scene[]> => {
+    const res = await axios.post(`${API_BASE}/projects/${projectId}/script/decompose`);
+    return res.data;
+  },
 
-  // Storyboard Scenes
+  // Storyboard Scenes CRUD & Media
   listScenes: async (projectId: string): Promise<Scene[]> => {
     const res = await axios.get(`${API_BASE}/projects/${projectId}/scenes`);
     return res.data;
   },
-  updateScene: async (projectId: string, sceneId: number, payload: Partial<Scene>): Promise<Scene> => {
-    const res = await axios.patch(`${API_BASE}/projects/${projectId}/scenes/${sceneId}`, payload);
+  addScene: async (projectId: string, narration: string, insertAfterUuid?: string): Promise<Scene> => {
+    const res = await axios.post(`${API_BASE}/projects/${projectId}/scenes`, {
+      narration,
+      insert_after_uuid: insertAfterUuid
+    });
     return res.data;
   },
-  regenerateSceneImage: async (projectId: string, sceneId: number): Promise<Scene> => {
-    const res = await axios.post(`${API_BASE}/projects/${projectId}/scenes/${sceneId}/regenerate_image`);
+  patchScene: async (sceneUuid: string, payload: Partial<Scene>): Promise<Scene> => {
+    const res = await axios.patch(`${API_BASE}/scenes/${sceneUuid}`, payload);
     return res.data;
   },
-  regenerateSceneTTS: async (projectId: string, sceneId: number): Promise<Scene> => {
-    const res = await axios.post(`${API_BASE}/projects/${projectId}/scenes/${sceneId}/regenerate_tts`);
+  deleteScene: async (sceneUuid: string): Promise<void> => {
+    await axios.delete(`${API_BASE}/scenes/${sceneUuid}`);
+  },
+  splitScene: async (sceneUuid: string, splitIndex?: number, splitText?: string): Promise<Scene[]> => {
+    const res = await axios.post(`${API_BASE}/scenes/${sceneUuid}/split`, { split_index: splitIndex, split_text: splitText });
+    return res.data;
+  },
+  mergeScenes: async (firstUuid: string, secondUuid: string): Promise<Scene> => {
+    const res = await axios.post(`${API_BASE}/scenes/merge`, {
+      first_scene_uuid: firstUuid,
+      second_scene_uuid: secondUuid
+    });
+    return res.data;
+  },
+  reorderScenes: async (projectId: string, sceneUuids: string[]): Promise<Scene[]> => {
+    const res = await axios.post(`${API_BASE}/projects/${projectId}/scenes/reorder`, { scene_uuids: sceneUuids });
+    return res.data;
+  },
+  generateSceneImage: async (sceneUuid: string): Promise<Scene> => {
+    const res = await axios.post(`${API_BASE}/scenes/${sceneUuid}/generate-image`);
+    return res.data;
+  },
+  generateSceneTTS: async (sceneUuid: string): Promise<Scene> => {
+    const res = await axios.post(`${API_BASE}/scenes/${sceneUuid}/generate-tts`);
+    return res.data;
+  },
+  renderSceneClip: async (sceneUuid: string): Promise<Scene> => {
+    const res = await axios.post(`${API_BASE}/scenes/${sceneUuid}/render-clip`);
+    return res.data;
+  },
+  uploadSceneImage: async (sceneUuid: string, file: File): Promise<Scene> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await axios.post(`${API_BASE}/scenes/${sceneUuid}/upload-image`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    });
+    return res.data;
+  },
+  uploadSceneAudio: async (sceneUuid: string, file: File): Promise<Scene> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await axios.post(`${API_BASE}/scenes/${sceneUuid}/upload-audio`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    });
     return res.data;
   },
 
@@ -87,11 +219,11 @@ export const api = {
 
   // Jobs
   getJobStatus: async (jobId: string): Promise<Job> => {
-    const res = await axios.get(`${API_BASE}/jobs/${jobId}`);
+    const res = await axios.get(`${API_BASE}/jobs/${jobId}`, { timeout: 10000 });
     return res.data;
   },
-  retryFailedTasks: async (jobId: string): Promise<Job> => {
-    const res = await axios.post(`${API_BASE}/jobs/${jobId}/retry_failed`);
+  cancelJob: async (jobId: string): Promise<{ message: string }> => {
+    const res = await axios.post(`${API_BASE}/jobs/${jobId}/cancel`);
     return res.data;
   },
 
@@ -123,10 +255,12 @@ export const api = {
     const res = await axios.get(`${API_BASE}/settings/ffmpeg`);
     return res.data;
   },
-
-  // Render & Export
-  startRender: async (projectId: string): Promise<{ status: string; output_path: string }> => {
-    const res = await axios.post(`${API_BASE}/projects/${projectId}/render`);
+  simulateApiError: async (errorCode: number | null): Promise<{ status: string; simulated_error: number | null }> => {
+    const res = await axios.post(`${API_BASE}/settings/simulate-error`, { error_code: errorCode });
+    return res.data;
+  },
+  getSimulatedApiError: async (): Promise<{ simulated_error: number | null }> => {
+    const res = await axios.get(`${API_BASE}/settings/simulate-error`);
     return res.data;
   }
 };

@@ -1,4 +1,5 @@
 import shutil
+import os
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -7,21 +8,24 @@ from app.models import ProviderSetting
 from app.schemas import ProviderSettingCreate, ProviderSettingResponse
 from app.services.key_store import set_api_key, has_api_key, delete_api_key
 from app.services.providers.factory import get_text_provider, get_image_provider, get_tts_provider
-from app.config import FFMPEG_PATH, FFPROBE_PATH
+from app.config import FFMPEG_PATH, FFPROBE_PATH, DATA_DIR
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 DEFAULT_PROVIDERS = [
-    {"name": "gemini", "type": "text", "model": "gemini-3.6-flash"},
-    {"name": "gemini_image", "type": "image", "model": "imagen-3.0-generate-002"},
+    {"name": "gemini", "type": "text", "model": "auto"},
+    {"name": "gemini_image", "type": "image", "model": "auto"},
+    {"name": "local_cards", "type": "image", "model": "local-cards"},
     {"name": "openai", "type": "text", "model": "gpt-4o", "url": "https://api.openai.com/v1"},
     {"name": "openai_image", "type": "image", "model": "dall-e-3", "url": "https://api.openai.com/v1"},
     {"name": "openai_tts", "type": "tts", "model": "tts-1", "voice": "onyx", "url": "https://api.openai.com/v1"},
     {"name": "elevenlabs", "type": "tts", "model": "eleven_multilingual_v2", "voice": "JBFqnCBsd6RMkjVDRZzb"},
     {"name": "fish_audio", "type": "tts", "model": "fish-speech-1.5", "voice": "reference_id"},
+    {"name": "windows_tts", "type": "tts", "model": "system-speech"},
+    {"name": "edge_tts", "type": "tts", "model": "edge-neural", "voice": "ru-RU-DmitryNeural"},
     {"name": "ai_horde", "type": "text", "model": "PHG/Pygmalion-3B", "url": "https://aihorde.net/api/v2"},
     {"name": "ai_horde_image", "type": "image", "model": "Deliberate", "url": "https://aihorde.net/api/v2"},
-    {"name": "openrouter", "type": "text", "model": "anthropic/claude-3.5-sonnet", "url": "https://openrouter.ai/api/v1"},
+    {"name": "openrouter", "type": "text", "model": "openrouter/free", "url": "https://openrouter.ai/api/v1"},
     {"name": "deepseek", "type": "text", "model": "deepseek-chat", "url": "https://api.deepseek.com/v1"},
 ]
 
@@ -41,8 +45,6 @@ def init_default_providers(db: Session):
                 voice_id=p.get("voice")
             )
             db.add(setting)
-        elif existing.provider_name == "gemini" and existing.model_id == "gemini-2.5-flash":
-            existing.model_id = "gemini-3.6-flash"
     db.commit()
 
 
@@ -52,7 +54,7 @@ def get_providers(db: Session = Depends(get_db)):
     providers = db.query(ProviderSetting).all()
     res = []
     for p in providers:
-        item = ProviderSettingResponse.from_orm(p)
+        item = ProviderSettingResponse.model_validate(p)
         item.has_api_key = has_api_key(p.provider_name)
         res.append(item)
     return res
@@ -89,7 +91,7 @@ def save_provider_setting(payload: ProviderSettingCreate, db: Session = Depends(
         else:
             delete_api_key(payload.provider_name)
 
-    res = ProviderSettingResponse.from_orm(existing)
+    res = ProviderSettingResponse.model_validate(existing)
     res.has_api_key = has_api_key(existing.provider_name)
     return res
 
@@ -126,4 +128,65 @@ def check_ffmpeg_status():
         "ffprobe_installed": ffprobe_found,
         "ffmpeg_path": FFMPEG_PATH,
         "ffprobe_path": FFPROBE_PATH
+    }
+
+
+@router.get("/preflight")
+async def check_local_preflight():
+    """Only local checks; does not send prompts or test paid API keys."""
+    import tempfile
+    from app.services.providers.windows_tts_provider import WindowsTTSProvider
+
+    ffmpeg_ready = bool(shutil.which(FFMPEG_PATH))
+    ffprobe_ready = bool(shutil.which(FFPROBE_PATH))
+    try:
+        with tempfile.TemporaryFile(dir=DATA_DIR):
+            pass
+        storage_ready = True
+    except OSError:
+        storage_ready = False
+    try:
+        voice_ready = await WindowsTTSProvider().test_connection()
+    except Exception:
+        voice_ready = False
+    try:
+        import edge_tts
+        edge_tts_ready = True
+    except ImportError:
+        edge_tts_ready = False
+    free_bytes = shutil.disk_usage(DATA_DIR).free if storage_ready else 0
+    return {
+        "ffmpeg_ready": ffmpeg_ready,
+        "ffprobe_ready": ffprobe_ready,
+        "storage_ready": storage_ready,
+        "windows_voice_ready": voice_ready,
+        "edge_tts_ready": edge_tts_ready,
+        "free_disk_gb": round(free_bytes / (1024 ** 3), 1),
+        "text_key_configured": has_api_key("gemini") or has_api_key("openrouter"),
+        "external_api_calls_made": False,
+    }
+
+from pydantic import BaseModel
+from typing import Optional
+
+class ErrorSimulationRequest(BaseModel):
+    error_code: Optional[int] = None
+
+@router.post("/simulate-error")
+def simulate_api_error(payload: ErrorSimulationRequest):
+    if os.environ.get("STORYFORGE_DEV_TOOLS") != "1":
+        raise HTTPException(status_code=404, detail="Инструменты разработчика отключены.")
+    from app.services.providers.mock_provider import set_simulated_error, get_simulated_error
+    set_simulated_error(payload.error_code)
+    return {
+        "status": "ok",
+        "simulated_error": get_simulated_error(),
+        "message": f"Simulated API Error set to {payload.error_code}" if payload.error_code else "API Error Simulation cleared."
+    }
+
+@router.get("/simulate-error")
+def get_simulated_api_error():
+    from app.services.providers.mock_provider import get_simulated_error
+    return {
+        "simulated_error": get_simulated_error()
     }

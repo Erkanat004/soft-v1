@@ -3,23 +3,36 @@ from sqlalchemy.orm import Session
 from app.models import ProviderSetting
 from app.services.key_store import get_api_key, has_api_key
 from app.services.providers.base import BaseTextProvider, BaseImageProvider, BaseTTSProvider
-from app.services.providers.mock_provider import MockTextProvider, MockImageProvider, MockTTSProvider
+from app.services.providers.mock_provider import MockTextProvider, MockImageProvider, MockTTSProvider, LocalCardImageProvider
 from app.services.providers.gemini_provider import GeminiTextProvider, GeminiImageProvider
 from app.services.providers.openai_provider import OpenAITextProvider, OpenAIImageProvider, OpenAITTSProvider
 from app.services.providers.elevenlabs_provider import ElevenLabsTTSProvider
 from app.services.providers.fish_audio_provider import FishAudioTTSProvider
 from app.services.providers.ai_horde_provider import AIHordeTextProvider, AIHordeImageProvider
 from app.services.providers.custom_provider import CustomTextProvider, CustomImageProvider
+from app.services.providers.windows_tts_provider import WindowsTTSProvider
+from app.services.providers.edge_tts_provider import EdgeTTSProvider
+from app.services.providers.fallback_text import FallbackTextProvider
+from app.services.errors import ProviderError
 
 logger = logging.getLogger("provider_factory")
 
 def get_text_provider(db: Session, provider_name: str = "gemini") -> BaseTextProvider:
+    if provider_name in ["mock", "mock_text"]:
+        return MockTextProvider()
+    if provider_name == "auto_text":
+        primary = get_text_provider(db, "gemini") if has_api_key("gemini") else None
+        backup = get_text_provider(db, "openrouter") if has_api_key("openrouter") else None
+        if primary and backup:
+            return FallbackTextProvider(primary, backup)
+        if primary or backup:
+            return primary or backup
+        raise ProviderError("Не задан ключ Gemini или OpenRouter. Добавьте ключ в настройках.", 503)
     setting = db.query(ProviderSetting).filter(ProviderSetting.provider_name == provider_name).first()
     
-    # If no API key configured, use MockProvider for instant dry-run testing
+    # Placeholders must be explicitly selected, never mistaken for AI output.
     if not has_api_key(provider_name) and provider_name not in ["mock", "ai_horde"]:
-        logger.info(f"No API key found for text provider '{provider_name}'. Falling back to MockTextProvider.")
-        return MockTextProvider()
+        raise ProviderError('Не задан ключ текстового провайдера. Проверьте настройки или выберите mock.', 503)
 
     model_id = setting.model_id if setting else None
     base_url = setting.base_url if setting else None
@@ -42,12 +55,15 @@ def get_text_provider(db: Session, provider_name: str = "gemini") -> BaseTextPro
     return MockTextProvider()
 
 def get_image_provider(db: Session, provider_name: str = "gemini_image") -> BaseImageProvider:
+    if provider_name in ["mock", "mock_image"]:
+        return MockImageProvider()
+    if provider_name == "local_cards":
+        return LocalCardImageProvider()
     setting = db.query(ProviderSetting).filter(ProviderSetting.provider_name == provider_name).first()
     
-    key_name = provider_name
-    if not has_api_key(key_name) and not has_api_key("gemini") and not has_api_key("openai") and provider_name not in ["ai_horde_image", "ai_horde"]:
-        logger.info(f"No API key found for image provider '{provider_name}'. Falling back to MockImageProvider.")
-        return MockImageProvider()
+    key_names = {'gemini_image': ('gemini_image', 'gemini'), 'openai_image': ('openai_image', 'openai')}.get(provider_name, (provider_name,))
+    if not any(has_api_key(name) for name in key_names) and provider_name not in ['ai_horde_image', 'ai_horde']:
+        raise ProviderError('Не задан ключ провайдера изображений. Проверьте настройки или выберите mock.', 503)
 
     model_id = setting.model_id if setting else None
     base_url = setting.base_url if setting else None
@@ -71,11 +87,19 @@ def get_image_provider(db: Session, provider_name: str = "gemini_image") -> Base
 
 
 def get_tts_provider(db: Session, provider_name: str = "elevenlabs") -> BaseTTSProvider:
+    if provider_name in ["mock", "mock_tts"]:
+        return MockTTSProvider()
+    if provider_name == "windows_tts":
+        return WindowsTTSProvider()
+    if provider_name == "edge_tts":
+        setting = db.query(ProviderSetting).filter(ProviderSetting.provider_name == "edge_tts").first()
+        voice_id = setting.voice_id if setting else None
+        return EdgeTTSProvider(voice_id=voice_id)
     setting = db.query(ProviderSetting).filter(ProviderSetting.provider_name == provider_name).first()
     
-    if not has_api_key(provider_name) and not has_api_key("elevenlabs") and not has_api_key("openai") and not has_api_key("fish_audio"):
-        logger.info(f"No API key found for TTS provider '{provider_name}'. Falling back to MockTTSProvider.")
-        return MockTTSProvider()
+    key_names = ('openai_tts', 'openai') if provider_name == 'openai_tts' else (provider_name,)
+    if not any(has_api_key(name) for name in key_names):
+        raise ProviderError('Не задан ключ провайдера озвучки. Проверьте настройки или выберите mock.', 503)
 
     model_id = setting.model_id if setting else None
     voice_id = setting.voice_id if setting else None
@@ -89,4 +113,3 @@ def get_tts_provider(db: Session, provider_name: str = "elevenlabs") -> BaseTTSP
         return OpenAITTSProvider(model_id=model_id, voice_id=voice_id, base_url=base_url, provider_name=provider_name)
 
     return MockTTSProvider()
-

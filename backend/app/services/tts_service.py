@@ -1,11 +1,13 @@
 import os
 import subprocess
 import logging
-import json
-from typing import Optional, List, Tuple
+import math
+from app.services.errors import ProviderError
+from typing import Optional, List
 from sqlalchemy.orm import Session
+
 from app.models import Project, Scene
-from app.config import FFPROBE_PATH
+from app.config import FFMPEG_PATH, FFPROBE_PATH, ALLOW_MOCK_FALLBACK, get_project_dir
 from app.services.providers.factory import get_tts_provider
 
 logger = logging.getLogger("tts_service")
@@ -27,9 +29,13 @@ def probe_audio_duration(audio_file_path: str) -> float:
     ]
 
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             encoding="utf-8", errors="replace", check=True, timeout=15)
         duration_str = res.stdout.strip()
-        return float(duration_str)
+        duration = float(duration_str)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError('Invalid audio duration')
+        return round(duration, 2)
     except (FileNotFoundError, Exception) as e:
         logger.warning(f"FFprobe execution unavailable for {audio_file_path}: {e}")
         # Try python wave module fallback if file is WAV
@@ -41,16 +47,47 @@ def probe_audio_duration(audio_file_path: str) -> float:
                 return round(frames / float(rate), 2)
         except Exception:
             pass
-        # Fallback to file size heuristic if ffprobe is unavailable
-        size_bytes = os.path.getsize(audio_file_path)
-        return max(3.0, round(size_bytes / 16000.0, 2))
+        raise ValueError('Не удалось прочитать аудио. Проверьте формат файла и установку FFprobe.') from None
 
 
-async def generate_scene_tts(db: Session, project: Project, scene: Scene) -> float:
+def slice_audio_file(source_audio_path: str, output_path: str, start_sec: float, duration_sec: float) -> str:
+    """
+    Physically slices an audio file using FFmpeg into a standalone sub-clip.
+    """
+    if not os.path.isfile(source_audio_path):
+        raise FileNotFoundError(f"Source audio file not found: {source_audio_path}")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    cmd = [
+        FFMPEG_PATH,
+        "-y",
+        "-ss", str(start_sec),
+        "-i", source_audio_path,
+        "-t", str(duration_sec),
+        "-c:a", "libmp3lame",
+        "-b:a", "192k",
+        output_path
+    ]
+
+    try:
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                       encoding="utf-8", errors="replace", check=True, timeout=120)
+        return output_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to slice audio {source_audio_path} [{start_sec}:{duration_sec}]: {e.stderr}")
+        raise RuntimeError(f"FFmpeg audio slice failed: {e.stderr}")
+
+
+async def generate_scene_tts(db: Session, project: Project, scene: Scene, voice_id: Optional[str] = None) -> float:
     """
     Generates TTS audio for scene narration, probes exact audio duration via FFprobe,
-    and updates scene actual_duration.
+    and updates scene actual_duration and tts_status.
     """
+    scene.tts_status = "running"
+    scene.error_message = None
+    db.commit()
+
     provider_name = project.active_tts_provider or "elevenlabs"
     from app.services.key_store import has_api_key
     if provider_name == "elevenlabs" and not has_api_key("elevenlabs") and has_api_key("fish_audio"):
@@ -58,137 +95,68 @@ async def generate_scene_tts(db: Session, project: Project, scene: Scene) -> flo
         project.active_tts_provider = "fish_audio"
         db.commit()
 
-    tts_provider = get_tts_provider(db, provider_name)
+    active_voice = voice_id or scene.voice_id or project.default_voice_id
 
-    
-    project_dir = os.path.join("projects", project.id, "audio")
-    os.makedirs(project_dir, exist_ok=True)
+    audio_dir = get_project_dir(project.id, "audio")
+    extension = ".wav" if provider_name == "windows_tts" else ".mp3"
+    filename = f"scene_{scene.scene_uuid}{extension}"
+    audio_path = str(audio_dir / filename)
+    tmp_path = str(audio_dir / f"scene_{scene.scene_uuid}.tmp{extension}")
 
-    filename = f"scene_{scene.scene_order:03d}.mp3"
-    audio_path = os.path.join(project_dir, filename)
+    logger.info(f"Generating TTS for scene {scene.scene_order} (uuid: {scene.scene_uuid}) in project {project.id}")
 
-    # Cache check: if audio file already exists, don't re-generate unless explicitly triggered
-    if os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0 and scene.status != "pending":
-        duration = probe_audio_duration(audio_path)
-        scene.audio_path = audio_path
-        scene.actual_duration = duration
-        db.commit()
-        return duration
-
-    logger.info(f"Generating TTS for scene {scene.scene_order} in project {project.id}")
     try:
-        audio_file = await tts_provider.generate_speech(scene.narration, save_path=audio_path)
+        tts_provider = get_tts_provider(db, provider_name)
+        # Pass voice_id if supported by provider
+        audio_file = await tts_provider.generate_speech(
+            scene.narration,
+            voice_id=active_voice,
+            save_path=tmp_path,
+        )
+        if not os.path.isfile(audio_file) or os.path.getsize(audio_file) == 0:
+            raise ProviderError('Провайдер озвучки вернул пустой файл.')
+        duration = probe_audio_duration(audio_file)
+        os.replace(audio_file, audio_path)
+        audio_file = audio_path
     except Exception as e:
-        logger.warning(f"TTS Provider '{project.active_tts_provider}' failed ({e}). Falling back to Mock TTS.")
-        from app.services.providers.mock_provider import MockTTSProvider
-        mock_tts = MockTTSProvider()
-        audio_file = await mock_tts.generate_speech(scene.narration, save_path=audio_path)
-
-    
-    # Probe duration via FFprobe
-    duration = probe_audio_duration(audio_file)
+        logger.error(f"TTS Provider '{provider_name}' failed for scene {scene.scene_uuid}: {e}")
+        if ALLOW_MOCK_FALLBACK:
+            logger.warning("ALLOW_MOCK_FALLBACK=True: Falling back to Mock TTS.")
+            from app.services.providers.mock_provider import MockTTSProvider
+            mock_tts = MockTTSProvider()
+            audio_file = await mock_tts.generate_speech(scene.narration, save_path=tmp_path)
+            duration = probe_audio_duration(audio_file)
+            os.replace(audio_file, audio_path)
+            audio_file = audio_path
+        else:
+            scene.tts_status = "error"
+            scene.error_message = f"TTS generation failed ({provider_name}): {str(e)}"
+            db.commit()
+            if isinstance(e, ProviderError):
+                raise
+            raise ProviderError(scene.error_message) from None
+    finally:
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
     
     scene.audio_path = audio_file
     scene.actual_duration = duration
-    scene.status = "tts_done"
+    scene.audio_offset_start = 0.0
+    scene.audio_offset_end = duration
+    scene.tts_status = "completed"
+    if scene.clip_status == "completed":
+        scene.clip_status = "outdated"
+    scene.error_message = None
     db.commit()
 
     return duration
 
+
 def sync_and_split_scenes_post_tts(db: Session, project: Project) -> List[Scene]:
+    """Keep text and audio bound to the same scene without word timestamps.
+
+    Splitting audio by equal seconds and narration by equal word counts can
+    put different spoken words under the wrong subtitles. A longer scene is
+    preferable until a provider supplies exact word timing for safe splits.
     """
-    Post-TTS check:
-    If a scene's TTS audio duration > 20s, splits the visual scene into sub-scenes (A, B)
-    with target visual duration 10-20s.
-    If a scene's TTS audio duration < 5s, merges narration with adjacent scene.
-    """
-    scenes = db.query(Scene).filter(Scene.project_id == project.id).order_by(Scene.scene_order).all()
-    if not scenes:
-        return []
-
-    modified = False
-    new_scene_dicts = []
-    current_order = 1
-
-    for sc in scenes:
-        duration = sc.actual_duration or sc.duration_target
-        if duration > 22.0:
-            # Split visual scene into 2 sub-scenes (e.g., 35s -> 17.5s + 17.5s)
-            num_splits = 2 if duration <= 40.0 else 3
-            part_duration = round(duration / num_splits, 2)
-            
-            # Split narration into parts
-            narration_parts = sc.narration.split(". ")
-            half_idx = max(1, len(narration_parts) // num_splits)
-            part1_text = ". ".join(narration_parts[:half_idx]) + "."
-            part2_text = ". ".join(narration_parts[half_idx:])
-            if not part2_text:
-                part2_text = sc.narration
-
-            # Sub-scene A dict
-            new_scene_dicts.append({
-                "project_id": project.id,
-                "scene_order": current_order,
-                "narration": part1_text,
-                "shot_type": "Medium Shot",
-                "camera_motion": sc.camera_motion,
-                "transition": sc.transition,
-                "image_prompt": sc.image_prompt,
-                "enhanced_prompt": sc.enhanced_prompt,
-                "duration_target": part_duration,
-                "actual_duration": part_duration,
-                "audio_path": sc.audio_path,
-                "status": "tts_done",
-                "character_ids_json": sc.character_ids_json,
-                "location_id": sc.location_id
-            })
-            current_order += 1
-
-            # Sub-scene B dict
-            new_scene_dicts.append({
-                "project_id": project.id,
-                "scene_order": current_order,
-                "narration": part2_text,
-                "shot_type": "Close-Up" if sc.shot_type != "Close-Up" else "Wide Shot",
-                "camera_motion": "pan_right" if sc.camera_motion != "pan_right" else "slow_zoom_in",
-                "transition": "crossfade",
-                "image_prompt": f"{sc.image_prompt}, alternate camera perspective",
-                "enhanced_prompt": f"{sc.enhanced_prompt}, close perspective",
-                "duration_target": part_duration,
-                "actual_duration": part_duration,
-                "audio_path": sc.audio_path,
-                "status": "tts_done",
-                "character_ids_json": sc.character_ids_json,
-                "location_id": sc.location_id
-            })
-            current_order += 1
-            modified = True
-        else:
-            new_scene_dicts.append({
-                "project_id": project.id,
-                "scene_order": current_order,
-                "narration": sc.narration,
-                "shot_type": sc.shot_type,
-                "camera_motion": sc.camera_motion,
-                "transition": sc.transition,
-                "image_prompt": sc.image_prompt,
-                "enhanced_prompt": sc.enhanced_prompt,
-                "duration_target": sc.duration_target,
-                "actual_duration": sc.actual_duration,
-                "audio_path": sc.audio_path,
-                "image_path": sc.image_path,
-                "video_clip_path": sc.video_clip_path,
-                "status": sc.status,
-                "character_ids_json": sc.character_ids_json,
-                "location_id": sc.location_id
-            })
-            current_order += 1
-
-    if modified:
-        db.query(Scene).filter(Scene.project_id == project.id).delete()
-        db.commit()
-        for d in new_scene_dicts:
-            db.add(Scene(**d))
-        db.commit()
-
     return db.query(Scene).filter(Scene.project_id == project.id).order_by(Scene.scene_order).all()

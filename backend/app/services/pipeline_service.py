@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
@@ -11,9 +10,23 @@ from app.services.job_queue import job_manager
 
 logger = logging.getLogger("pipeline_service")
 
-async def run_auto_pipeline(project_id: str, job_id: str):
+
+class PipelineCancelled(Exception):
+    pass
+
+
+def ensure_job_can_continue(db: Session, job_id: str):
+    job = db.query(Job).populate_existing().filter(Job.id == job_id).first()
+    if not job:
+        raise RuntimeError(f"Job {job_id} no longer exists")
+    if job.status == "cancelled":
+        raise PipelineCancelled(f"Job {job_id} was cancelled")
+    if job.status == "failed":
+        raise RuntimeError(job.error_message or f"Job {job_id} failed")
+
+async def run_auto_remaining_pipeline(project_id: str, job_id: str):
     """
-    Executes the complete 13-step 100% automated video generation pipeline.
+    Executes remaining missing steps in project creation workflow without overwriting valid assets.
     """
     db = SessionLocal()
     try:
@@ -24,60 +37,70 @@ async def run_auto_pipeline(project_id: str, job_id: str):
         project.status = "generating"
         project.current_stage = "starting"
         db.commit()
+        ensure_job_can_continue(db, job_id)
 
-        # Step 1-3: Script Generation + Character & Location Bibles
-        job_manager.update_job_progress(db, job_id, 0, 0, 100, "script", "Generating story script and analyzing Bibles...")
+        # Step 1: Script check / generation
+        job_manager.update_job_progress(db, job_id, 0, 0, 100, "script", "Checking script...")
         script, characters, locations = await prepare_project_script(db, project)
-        project.current_stage = "bibles_ready"
-        db.commit()
+        ensure_job_can_continue(db, job_id)
 
-        # Step 4-5: Scene Splitting & Image Prompt Generation with Shot Rotation
-        job_manager.update_job_progress(db, job_id, 15, 0, 100, "scenes", "Splitting script into visual scenes and prompts...")
-        scenes = await decompose_script_to_scenes(db, project, script.text)
-        project.current_stage = "scenes_ready"
-        db.commit()
+        # Step 2: Scenes check / decomposition
+        scenes = db.query(Scene).filter(Scene.project_id == project_id).order_by(Scene.scene_order).all()
+        if not scenes:
+            job_manager.update_job_progress(db, job_id, 15, 0, 100, "scenes", "Splitting script into visual scenes...")
+            scenes = await decompose_script_to_scenes(db, project, script.text)
+        ensure_job_can_continue(db, job_id)
 
-        # Step 6-7: TTS Generation per Scene & FFprobe Audio Duration Probing
-        job_manager.update_job_progress(db, job_id, 30, 0, 100, "tts", "Generating TTS voiceover audio per scene...")
-        for sc in scenes:
-            await generate_scene_tts(db, project, sc)
+        # Step 3: Batch TTS
+        job_manager.update_job_progress(db, job_id, 30, 0, 100, "tts", "Generating voiceovers for scenes...")
+        await job_manager.execute_batch_tts_generation(project_id, job_id, finalize_job=False)
+        ensure_job_can_continue(db, job_id)
 
-        # Step 8: Post-TTS Duration Sync & Sub-Scene Splitter (Target 10-20s visual duration)
-        job_manager.update_job_progress(db, job_id, 45, 0, 100, "duration_sync", "Probing audio durations via FFprobe and syncing visual scenes...")
-        scenes = sync_and_split_scenes_post_tts(db, project)
-        project.current_stage = "tts_ready"
-        db.commit()
+        # Step 4: Batch Images
+        job_manager.update_job_progress(db, job_id, 60, 0, 100, "images", "Generating scene images in parallel...")
+        await job_manager.execute_batch_image_generation(project_id, job_id, finalize_job=False)
+        ensure_job_can_continue(db, job_id)
 
-        # Step 9: Batch Concurrent Image Generation with 3x Retry & Resume Checkpoint
-        job_manager.update_job_progress(db, job_id, 55, 0, 100, "images", "Generating scene images in parallel queue...")
-        await job_manager.execute_batch_image_generation(project_id, job_id)
-
-        # Refresh project & scenes state
-        project = db.query(Project).filter(Project.id == project_id).first()
-        project.current_stage = "images_ready"
-        db.commit()
-
-        # Step 10-13: FFmpeg Ken Burns Motion + Transitions + Music + Subtitles + MP4 Render
-        job_manager.update_job_progress(db, job_id, 85, 0, 100, "render", "Rendering final MP4 video via local FFmpeg...")
+        # Step 5: Render final video
+        job_manager.update_job_progress(db, job_id, 85, 0, 100, "render", "Rendering final MP4 video...")
         final_video_path = await render_full_project_video(db, project, burn_subtitles=True)
+        ensure_job_can_continue(db, job_id)
 
         job_manager.update_job_progress(db, job_id, 100, 0, 100, "completed", "Video rendering completed successfully!")
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job:
+            job.status = "completed"
+            job.progress_pct = 100.0
         project.status = "completed"
         project.current_stage = "completed"
+        project.active_job_id = None
         db.commit()
-        logger.info(f"Auto pipeline completed successfully for project {project_id}: {final_video_path}")
+        logger.info(f"Auto remaining pipeline completed for project {project_id}: {final_video_path}")
 
+    except PipelineCancelled:
+        db.rollback()
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if project:
+            project.status = "draft"
+            project.current_stage = "cancelled"
+            if project.active_job_id == job_id:
+                project.active_job_id = None
+            db.commit()
+        logger.info(f"Auto pipeline cancelled for project {project_id}")
     except Exception as e:
         logger.error(f"Auto pipeline failed for project {project_id}: {e}")
+        db.rollback()
         project = db.query(Project).filter(Project.id == project_id).first()
         if project:
             project.status = "failed"
             project.error_message = str(e)
             project.current_stage = "failed"
+            if project.active_job_id == job_id:
+                project.active_job_id = None
             db.commit()
         
         job = db.query(Job).filter(Job.id == job_id).first()
-        if job:
+        if job and job.status != 'cancelled':
             job.status = "failed"
             job.error_message = str(e)
             db.commit()

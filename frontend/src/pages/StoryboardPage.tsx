@@ -1,15 +1,28 @@
 import React, { useEffect, useState } from 'react';
-import { Project, Scene } from '../types';
+import { Job, Project, Scene } from '../types';
 import { api } from '../api';
-import { Film, RefreshCw, Volume2, Image as ImageIcon, Camera, Sparkles } from 'lucide-react';
+import { Film, RefreshCw, Wand2, Plus, Play, Sparkles, Filter, CheckSquare, Layers } from 'lucide-react';
+import { SceneCard } from '../components/SceneCard';
+import { ScenePreviewModal } from '../components/ScenePreviewModal';
 
 interface StoryboardPageProps {
   project: Project;
+  onNavigateToExport?: () => void;
+  onJobStarted?: (job: Job) => void;
 }
 
-export const StoryboardPage: React.FC<StoryboardPageProps> = ({ project }) => {
+export const StoryboardPage: React.FC<StoryboardPageProps> = ({ project, onNavigateToExport, onJobStarted }) => {
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [loading, setLoading] = useState(true);
+  const [selectedUuids, setSelectedUuids] = useState<Set<string>>(new Set());
+  const [activeFilter, setActiveFilter] = useState<'all' | 'missing_image' | 'missing_tts' | 'outdated' | 'error'>('all');
+  const [previewScene, setPreviewScene] = useState<Scene | null>(null);
+  const [isRunningBatch, setIsRunningBatch] = useState(false);
+
+  const confirmExternal = (provider: string, kind: string, count: number) => {
+    if (provider === 'local_cards' || provider === 'windows_tts' || provider === 'mock') return true;
+    return window.confirm(`${kind}: будет отправлено до ${count} запросов провайдеру ${provider}. Стоимость и лимиты определяются вашим тарифом. Продолжить?`);
+  };
 
   const loadScenes = async () => {
     setLoading(true);
@@ -27,131 +40,341 @@ export const StoryboardPage: React.FC<StoryboardPageProps> = ({ project }) => {
     loadScenes();
   }, [project.id]);
 
-  const handleRegenerateImage = async (sceneId: number) => {
-    try {
-      await api.regenerateSceneImage(project.id, sceneId);
-      loadScenes();
-    } catch (err) {
-      alert("Failed to regenerate image");
+  const handleSelectScene = (uuid: string, selected: boolean) => {
+    const next = new Set(selectedUuids);
+    if (selected) next.add(uuid);
+    else next.delete(uuid);
+    setSelectedUuids(next);
+  };
+
+  const handleSelectAll = (select: boolean) => {
+    if (select) {
+      setSelectedUuids(new Set(scenes.map(s => s.scene_uuid)));
+    } else {
+      setSelectedUuids(new Set());
     }
   };
 
-  const handleRegenerateTTS = async (sceneId: number) => {
+  const handleUpdateScene = async (uuid: string, updates: Partial<Scene>) => {
     try {
-      await api.regenerateSceneTTS(project.id, sceneId);
-      loadScenes();
+      const updated = await api.patchScene(uuid, updates);
+      setScenes(prev => prev.map(s => s.scene_uuid === uuid ? updated : s));
     } catch (err) {
-      alert("Failed to regenerate TTS audio");
+      console.error("Failed to update scene:", err);
     }
   };
+
+  const handleDeleteScene = async (uuid: string) => {
+    if (!window.confirm("Удалить выбранную сцену?")) return;
+    try {
+      await api.deleteScene(uuid);
+      loadScenes();
+    } catch (err) {
+      alert("Ошибка при удалении сцены");
+    }
+  };
+
+  const handleSplitScene = async (uuid: string) => {
+    try {
+      await api.splitScene(uuid);
+      loadScenes();
+    } catch (err) {
+      alert("Не удалось разбить сцену");
+    }
+  };
+
+  const handleMergeScenes = async (uuid1: string) => {
+    const idx = scenes.findIndex(s => s.scene_uuid === uuid1);
+    if (idx === -1 || idx >= scenes.length - 1) return;
+    const uuid2 = scenes[idx + 1].scene_uuid;
+    try {
+      await api.mergeScenes(uuid1, uuid2);
+      loadScenes();
+    } catch (err) {
+      alert("Не удалось объединить сцены");
+    }
+  };
+
+  const handleAddScene = async () => {
+    const text = prompt("Введите дикторский текст для новой сцены:");
+    if (!text || !text.trim()) return;
+    try {
+      await api.addScene(project.id, text.trim());
+      loadScenes();
+    } catch (err) {
+      alert("Не удалось добавить сцену");
+    }
+  };
+
+  const handleGenerateImage = async (uuid: string) => {
+    if (!confirmExternal(project.active_image_provider, 'Изображение', 1)) return;
+    try {
+      const updated = await api.generateSceneImage(uuid);
+      setScenes(prev => prev.map(s => s.scene_uuid === uuid ? updated : s));
+    } catch (err: any) {
+      alert(`Ошибка генерации изображения: ${err?.response?.data?.detail || err.message}`);
+      loadScenes();
+    }
+  };
+
+  const handleGenerateTTS = async (uuid: string) => {
+    if (!confirmExternal(project.active_tts_provider, 'Озвучка', 1)) return;
+    try {
+      const updated = await api.generateSceneTTS(uuid);
+      setScenes(prev => prev.map(s => s.scene_uuid === uuid ? updated : s));
+    } catch (err: any) {
+      alert(`Ошибка генерации озвучки: ${err?.response?.data?.detail || err.message}`);
+      loadScenes();
+    }
+  };
+
+  const handleRenderClip = async (uuid: string) => {
+    try {
+      const updated = await api.renderSceneClip(uuid);
+      setScenes(prev => prev.map(s => s.scene_uuid === uuid ? updated : s));
+    } catch (err: any) {
+      alert(`Ошибка рендера клипа: ${err?.response?.data?.detail || err.message}`);
+      loadScenes();
+    }
+  };
+
+  const handleUploadImage = async (uuid: string, file: File) => {
+    try {
+      const updated = await api.uploadSceneImage(uuid, file);
+      setScenes(prev => prev.map(s => s.scene_uuid === uuid ? updated : s));
+    } catch (err) {
+      alert("Ошибка загрузки изображения");
+    }
+  };
+
+  const handleUploadAudio = async (uuid: string, file: File) => {
+    try {
+      const updated = await api.uploadSceneAudio(uuid, file);
+      setScenes(prev => prev.map(s => s.scene_uuid === uuid ? updated : s));
+    } catch (err) {
+      alert("Ошибка загрузки аудиофайла");
+    }
+  };
+
+  const handleBatchImages = async () => {
+    if (!confirmExternal(project.active_image_provider, 'Пакет изображений', scenes.length)) return;
+    setIsRunningBatch(true);
+    try {
+      const job = await api.triggerBatchImages(project.id);
+      onJobStarted?.(job);
+    } catch (err) {
+      alert("Ошибка запуска пакетной генерации картинок");
+    } finally {
+      setIsRunningBatch(false);
+    }
+  };
+
+  const handleBatchTTS = async () => {
+    if (!confirmExternal(project.active_tts_provider, 'Пакет озвучки', scenes.length)) return;
+    setIsRunningBatch(true);
+    try {
+      const job = await api.triggerBatchTTS(project.id);
+      onJobStarted?.(job);
+    } catch (err) {
+      alert("Ошибка запуска пакетной озвучки");
+    } finally {
+      setIsRunningBatch(false);
+    }
+  };
+
+  const handleBatchClips = async () => {
+    setIsRunningBatch(true);
+    try {
+      const job = await api.triggerBatchClips(project.id);
+      onJobStarted?.(job);
+    } catch (err) {
+      alert("Ошибка запуска пакетного рендера");
+    } finally {
+      setIsRunningBatch(false);
+    }
+  };
+
+  const handleAutoRemaining = async () => {
+    if (!window.confirm('Авторежим может вызвать внешние AI API для сценария, изображений и озвучки. Стоимость зависит от ваших ключей и тарифа. Продолжить?')) return;
+    setIsRunningBatch(true);
+    try {
+      const job = await api.triggerAutoRemaining(project.id);
+      onJobStarted?.(job);
+    } catch (err) {
+      alert("Ошибка запуска авто-доработки");
+    } finally {
+      setIsRunningBatch(false);
+    }
+  };
+
+  const filteredScenes = scenes.filter(s => {
+    if (activeFilter === 'missing_image') return s.image_status !== 'completed';
+    if (activeFilter === 'missing_tts') return s.tts_status !== 'completed';
+    if (activeFilter === 'outdated') return s.image_status === 'outdated' || s.tts_status === 'outdated' || s.clip_status === 'outdated';
+    if (activeFilter === 'error') return s.image_status === 'error' || s.tts_status === 'error' || s.clip_status === 'error';
+    return true;
+  });
 
   return (
     <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
-      <div className="flex items-center justify-between border-b border-dark-700 pb-4">
+      {/* Top Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
         <div>
           <h2 className="text-2xl font-bold text-white flex items-center gap-3">
-            <Film className="w-6 h-6 text-purple-400" />
-            <span>Storyboard Scenes ({scenes.length})</span>
+            <Film className="w-6 h-6 text-indigo-400" />
+            <span>Раскадровка & Сцены ({scenes.length})</span>
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            Visual scene decomposition with narration, camera motion presets, image prompts, and audio durations.
+            Управляйте каждой сценой отдельно: редактируйте промпты, озвучку, анимации и клипы.
           </p>
         </div>
-        <button
-          onClick={loadScenes}
-          className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-slate-300 text-xs font-medium rounded-lg flex items-center gap-1.5"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          <span>Refresh</span>
-        </button>
+
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleAddScene}
+            className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl flex items-center gap-2 border border-slate-700"
+          >
+            <Plus className="w-4 h-4 text-indigo-400" />
+            <span>Добавить сцену</span>
+          </button>
+
+          <button
+            onClick={loadScenes}
+            className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl flex items-center gap-2 border border-slate-700"
+          >
+            <RefreshCw className="w-4 h-4" />
+            <span>Обновить</span>
+          </button>
+
+          {onNavigateToExport && (
+            <button
+              onClick={onNavigateToExport}
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl text-xs flex items-center gap-2 shadow-lg shadow-indigo-900/40"
+            >
+              <span>Сборка & Экспорт →</span>
+            </button>
+          )}
+        </div>
       </div>
 
+      {/* Batch Action Bar */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-md">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs font-semibold text-slate-400 flex items-center gap-1.5 mr-1">
+            <Wand2 className="w-4 h-4 text-indigo-400" />
+            <span>Пакетные действия:</span>
+          </span>
+
+          <button
+            onClick={handleBatchImages}
+            disabled={isRunningBatch}
+            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-medium rounded-lg border border-slate-700 disabled:opacity-50"
+          >
+            🎨 Сгенерировать все картинки
+          </button>
+
+          <button
+            onClick={handleBatchTTS}
+            disabled={isRunningBatch}
+            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-medium rounded-lg border border-slate-700 disabled:opacity-50"
+          >
+            🎙 Сгенерировать всю озвучку
+          </button>
+
+          <button
+            onClick={handleBatchClips}
+            disabled={isRunningBatch}
+            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-medium rounded-lg border border-slate-700 disabled:opacity-50"
+          >
+            🎬 Рендерить клипы
+          </button>
+
+          <button
+            onClick={handleAutoRemaining}
+            disabled={isRunningBatch}
+            className="px-3 py-1.5 bg-indigo-950 hover:bg-indigo-900 text-indigo-200 text-xs font-bold rounded-lg border border-indigo-700 disabled:opacity-50"
+          >
+            ⚡ Выполнить недостающие шаги
+          </button>
+        </div>
+
+        {/* Selection summary */}
+        <div className="flex items-center gap-2 text-xs text-slate-400">
+          <button
+            onClick={() => handleSelectAll(selectedUuids.size < scenes.length)}
+            className="flex items-center gap-1 text-slate-300 hover:text-white"
+          >
+            <CheckSquare className="w-4 h-4 text-indigo-400" />
+            <span>{selectedUuids.size === scenes.length ? 'Снять выделение' : 'Выделить все'}</span>
+          </button>
+          <span>({selectedUuids.size}/{scenes.length})</span>
+        </div>
+      </div>
+
+      {/* Filter Bar */}
+      <div className="flex items-center gap-2 overflow-x-auto pb-1 text-xs">
+        <span className="text-slate-500 font-semibold flex items-center gap-1 mr-1">
+          <Filter className="w-3.5 h-3.5" /> Фильтр:
+        </span>
+        {[
+          { key: 'all', label: `Все сцены (${scenes.length})` },
+          { key: 'missing_image', label: 'Без картинок' },
+          { key: 'missing_tts', label: 'Без озвучки' },
+          { key: 'outdated', label: 'Требуют обновления' },
+          { key: 'error', label: 'Ошибки' },
+        ].map(tab => (
+          <button
+            key={tab.key}
+            onClick={() => setActiveFilter(tab.key as any)}
+            className={`px-3 py-1.5 rounded-lg border font-medium transition-colors whitespace-nowrap ${
+              activeFilter === tab.key
+                ? 'bg-indigo-950 text-indigo-300 border-indigo-700'
+                : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Main Scenes List */}
       {loading ? (
-        <div className="text-center py-12 text-slate-500 text-sm">Loading scenes...</div>
-      ) : scenes.length === 0 ? (
-        <div className="text-center py-16 bg-dark-800 border border-dark-700 rounded-2xl p-8 space-y-3">
+        <div className="text-center py-16 text-slate-500 text-sm">Загрузка сценария и раскадровки...</div>
+      ) : filteredScenes.length === 0 ? (
+        <div className="text-center py-16 bg-slate-900 border border-slate-800 rounded-2xl p-8 space-y-3">
           <Film className="w-10 h-10 text-slate-600 mx-auto" />
-          <h4 className="text-base font-semibold text-slate-300">No scenes found</h4>
-          <p className="text-xs text-slate-500">Run AUTO MODE on the launcher home screen to automatically split script into visual scenes.</p>
+          <h4 className="text-base font-semibold text-slate-300">Сцены не найдены</h4>
+          <p className="text-xs text-slate-500">Нажмите "Добавить сцену" или перейдите в Редактор Сценария для авто-разбивки.</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {scenes.map((sc) => (
-            <div key={sc.id} className="bg-dark-800 border border-dark-700 rounded-2xl overflow-hidden shadow-xl flex flex-col justify-between">
-              
-              {/* Image Preview / Placeholder */}
-              <div className="aspect-video bg-dark-900 relative border-b border-dark-700/60 overflow-hidden group">
-                {sc.image_path ? (
-                  <img
-                    src={`/media/${sc.image_path.replace(/\\/g, '/')}`}
-                    alt={`Scene ${sc.scene_order}`}
-                    className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
-                  />
-                ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center text-slate-600 space-y-1">
-                    <ImageIcon className="w-8 h-8" />
-                    <span className="text-xs font-medium">Pending Image</span>
-                  </div>
-                )}
-
-                {/* Scene Order Badge */}
-                <div className="absolute top-2 left-2 px-2.5 py-1 rounded-lg bg-black/70 backdrop-blur-md text-white text-xs font-bold border border-white/10">
-                  Scene {sc.scene_order}
-                </div>
-
-                {/* Shot Type & Motion Badge */}
-                <div className="absolute bottom-2 right-2 px-2 py-0.5 rounded bg-purple-950/80 backdrop-blur-md text-purple-300 text-[10px] font-semibold border border-purple-800/40 flex items-center gap-1">
-                  <Camera className="w-3 h-3" />
-                  <span>{sc.shot_type} • {sc.camera_motion}</span>
-                </div>
-              </div>
-
-              {/* Scene Content */}
-              <div className="p-4 space-y-3 flex-1 flex flex-col justify-between">
-                <div className="space-y-2">
-                  <p className="text-xs text-slate-200 line-clamp-3 leading-relaxed font-medium">
-                    "{sc.narration}"
-                  </p>
-
-                  <div className="p-2.5 bg-dark-900/60 rounded-xl border border-dark-700/60 space-y-1">
-                    <span className="text-[10px] uppercase font-bold text-slate-500 flex items-center gap-1">
-                      <Sparkles className="w-3 h-3 text-purple-400" />
-                      Prompt
-                    </span>
-                    <p className="text-[11px] text-slate-400 line-clamp-2 italic">
-                      {sc.image_prompt}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Footer Controls */}
-                <div className="pt-2 border-t border-dark-700/60 flex items-center justify-between text-xs text-slate-400">
-                  <div className="flex items-center gap-1">
-                    <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
-                    <span>{sc.actual_duration ? `${sc.actual_duration.toFixed(1)}s` : `${sc.duration_target}s`}</span>
-                  </div>
-
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => handleRegenerateTTS(sc.id)}
-                      className="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 text-slate-300 text-[11px] font-medium rounded-lg"
-                    >
-                      TTS
-                    </button>
-                    <button
-                      onClick={() => handleRegenerateImage(sc.id)}
-                      className="px-2.5 py-1 bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-semibold rounded-lg shadow-md"
-                    >
-                      Image
-                    </button>
-                  </div>
-                </div>
-
-              </div>
-
-            </div>
+        <div className="space-y-4">
+          {filteredScenes.map((sc, idx) => (
+            <SceneCard
+              key={sc.scene_uuid}
+              scene={sc}
+              isSelected={selectedUuids.has(sc.scene_uuid)}
+              onSelect={handleSelectScene}
+              onUpdate={handleUpdateScene}
+              onDelete={handleDeleteScene}
+              onSplit={handleSplitScene}
+              onMergeWithNext={idx < filteredScenes.length - 1 ? handleMergeScenes : undefined}
+              onGenerateImage={handleGenerateImage}
+              onGenerateTTS={handleGenerateTTS}
+              onRenderClip={handleRenderClip}
+              onUploadImage={handleUploadImage}
+              onUploadAudio={handleUploadAudio}
+              onPreviewScene={(s) => setPreviewScene(s)}
+            />
           ))}
         </div>
+      )}
+
+      {/* Preview Modal */}
+      {previewScene && (
+        <ScenePreviewModal
+          scene={previewScene}
+          onClose={() => setPreviewScene(null)}
+        />
       )}
     </div>
   );

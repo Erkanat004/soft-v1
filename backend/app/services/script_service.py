@@ -26,103 +26,77 @@ def classify_input_type(text: str) -> str:
         return "topic"
     return "full_script"
 
-async def generate_longform_script(provider, project: Project) -> str:
+async def generate_script_from_topic(provider, project: Project) -> str:
     """
-    Generates a multi-chapter longform story script guaranteed to meet at least 30 minutes (minimum 4,200 words).
+    Generates a story script matching the user's requested target duration preset (e.g. 1, 5, 10, 20, 30, 40, 60 min).
     """
     try:
-        preset_mins = int(project.duration_preset)
+        preset_mins = float(project.duration_preset)
     except Exception:
-        preset_mins = 30
+        preset_mins = 10.0
     
-    # Enforce minimum 30 minutes
-    target_mins = max(30, preset_mins)
-    target_word_count = target_mins * 140  # 30 mins * 140 wpm = 4,200 words minimum
-    
+    # Target 140 words per minute of narration
+    target_words = max(80, int(preset_mins * 140))
     category_style = STORY_TEMPLATES.get(project.story_type, "Engaging dramatic story with strong narrative arc.")
-    logger.info(f"Generating longform script for project {project.id}: target {target_mins} mins, target {target_word_count} words")
+    logger.info(f"Generating script for project {project.id}: target {preset_mins} mins (~{target_words} words)")
 
-    # 1. Outline & Chapter Structure
-    outline_prompt = f"""
-You are an award-winning YouTube longform storyteller specializing in 30-60 minute immersive stories.
-Create a detailed 3-chapter narrative outline for a {target_mins}-minute audio story.
+    prompt = f"""
+You are an expert storyteller and YouTube scriptwriter.
+Create a complete, deeply immersive story script based on the following input:
 
 TOPIC: "{project.topic_or_script}"
-GENRE: {project.story_type} ({category_style})
+GENRE/TYPE: {project.story_type} ({category_style})
+TARGET DURATION: {preset_mins} minutes (target approx {target_words} words)
 LANGUAGE: {project.language}
+VISUAL STYLE: {project.visual_style}
+CREATIVE BRIEF: {project.creative_brief or 'None'}
 
-Output JSON with 3 distinct narrative chapters:
-{{
-  "chapter_1": "Chapter 1 Focus: Hook, detailed setting, character introduction, and the initial mysterious event.",
-  "chapter_2": "Chapter 2 Focus: Escalating complications, investigation, terrifying encounters, and deepening tension.",
-  "chapter_3": "Chapter 3 Focus: Major revelation, intense climax, final confrontation, and lingering haunting resolution."
-}}
+STORY STRUCTURE RULES:
+- Include a captivating HOOK in the first 2 sentences.
+- Develop rich narrative tension suitable for the target duration.
+- Do NOT include section titles like [HOOK] or [INTRO] in the text. Output pure storytelling narration.
+- Write vivid descriptive narration suitable for rich voiceover audio.
+- If a creative brief describes a reference, use only abstract observations such as pace and structure.
+- Do not reproduce distinctive wording, characters, scenes, or the sequence of a reference work.
+- Make the narration original to the user's topic and perspective.
 """
-    outline_raw = await provider.generate_text(outline_prompt)
-    try:
-        s_idx = outline_raw.find('{')
-        e_idx = outline_raw.rfind('}') + 1
-        outline_json = json.loads(outline_raw[s_idx:e_idx])
-    except Exception:
-        outline_json = {
-            "chapter_1": "Hook, character intro, mysterious event.",
-            "chapter_2": "Rising tension, investigation, terrifying encounters.",
-            "chapter_3": "Climax, resolution, final twist."
-        }
+    return await provider.generate_text(prompt)
 
-    # Generate each chapter sequentially to reach the word count target
-    chapters = []
-    previous_context = ""
-    for ch_key in ["chapter_1", "chapter_2", "chapter_3"]:
-        ch_focus = outline_json.get(ch_key, "Continue the story with deep suspense.")
-        ch_prompt = f"""
-Write Chapter {ch_key[-1]} of a {target_mins}-minute story in {project.language}.
+async def enhance_script_draft(db: Session, project: Project, instruction: str = "") -> str:
+    """
+    Generates a new enhanced version of the current script text for user review (accept/discard).
+    Does NOT overwrite active Script.text automatically.
+    """
+    provider = get_text_provider(db, project.active_text_provider)
+    script = db.query(Script).filter(Script.project_id == project.id).first()
+    current_text = script.text if script else project.topic_or_script
 
-TOPIC: "{project.topic_or_script}"
-GENRE: {project.story_type}
-CHAPTER DIRECTIVE: {ch_focus}
+    prompt = f"""
+You are an expert story editor.
+Refine and enhance the following story script in {project.language}.
 
-RULES:
-- Write a LONG, highly detailed, atmospheric narrative chapter (target at least 1,500 words for this chapter).
-- Include rich dialogue, internal thoughts, environmental descriptions, and slow-burn pacing.
-- Do NOT include chapter titles like [CHAPTER 1]. Output pure storytelling narration for audio voiceover.
-{f"PREVIOUS STORY CONTENT SUMMARY:\n{previous_context[-800:]}" if previous_context else ""}
+INSTRUCTION: {instruction or "Improve atmospheric tension, dialogue, sensory details, and narrative pacing."}
+
+CURRENT SCRIPT:
+\"\"\"{current_text}\"\"\"
+
+Output pure storytelling narration without section titles or metadata.
 """
-        ch_text = await provider.generate_text(ch_prompt)
-        ch_clean = ch_text.strip()
-        chapters.append(ch_clean)
-        previous_context += "\n\n" + ch_clean
-
-    full_script = "\n\n".join(chapters)
-    current_words = len(full_script.split())
-    logger.info(f"Generated initial longform script: {current_words} words")
-    
-    # If still under target_word_count, append an expansion chapter
-    if current_words < target_word_count:
-        logger.info(f"Script word count ({current_words}) is below target ({target_word_count}). Expanding with Epilogue/Aftermath...")
-        expand_prompt = f"""
-Extend and deepen the following story with an extended Chapter 4 (Epilogue, investigation aftermath, or secondary twist) in {project.language}.
-
-STORY SUMMARY SO FAR:
-\"\"\"{full_script[-1500:]}\"\"\"
-
-DIRECTIVE:
-Write an additional 1,500+ words extending the story narrative, revealing hidden details, aftermath, and final haunting resolution.
-Output pure story narration without section titles.
-"""
-        epilogue_text = await provider.generate_text(expand_prompt)
-        full_script += "\n\n" + epilogue_text.strip()
-        logger.info(f"Final expanded longform script: {len(full_script.split())} words")
-
-    return full_script
+    return await provider.generate_text(prompt)
 
 async def prepare_project_script(db: Session, project: Project) -> Tuple[Script, List[Character], List[Location]]:
     """
     Main entrypoint for Script + Character Bible + Location Bible generation.
-    Enforces minimum 30-minute longform video length.
+    Supports user scripts 100% as-is or topic-based script generation without forced 30-min minimum.
     """
+    project_id = project.id
+    existing = db.query(Script).filter(Script.project_id == project_id).first()
+    if existing and existing.text.strip():
+        return (existing,
+                db.query(Character).filter(Character.project_id == project_id).all(),
+                db.query(Location).filter(Location.project_id == project_id).all())
     provider = get_text_provider(db, project.active_text_provider)
-    
+
     input_kind = project.input_type
     if input_kind == "auto":
         input_kind = classify_input_type(project.topic_or_script)
@@ -130,29 +104,10 @@ async def prepare_project_script(db: Session, project: Project) -> Tuple[Script,
     # 1. Script Generation / Refinement
     final_script_text = ""
     if input_kind == "topic":
-        final_script_text = await generate_longform_script(provider, project)
+        final_script_text = await generate_script_from_topic(provider, project)
     else:
-        logger.info(f"Using provided script text for project {project.id}")
-        user_text = project.topic_or_script
-        words = len(user_text.split())
-        # If user provided script is shorter than 30 mins (4200 words), auto-expand it to 30 mins minimum
-        if words < 4200:
-            logger.info(f"User script ({words} words) is below 30-minute minimum (4200 words). Expanding script...")
-            expand_prompt = f"""
-You are a master longform YouTube scriptwriter.
-Expand the following user story script into a rich, detailed 30+ minute narrative script in {project.language}.
-
-USER SCRIPT:
-\"\"\"{user_text}\"\"\"
-
-DIRECTIVE:
-- Expand descriptions, internal monologues, dialogue, sensory details, and tension build-up.
-- Target at least 4,200 words (30 minutes of voiceover).
-- Output pure storytelling narration without section headers.
-"""
-            final_script_text = await provider.generate_text(expand_prompt)
-        else:
-            final_script_text = user_text
+        logger.info(f"Using provided script text as-is for project {project.id}")
+        final_script_text = project.topic_or_script
 
     # Save or update Script record
     script = db.query(Script).filter(Script.project_id == project.id).first()
@@ -163,6 +118,11 @@ DIRECTIVE:
         script.text = final_script_text
         script.is_user_provided = (input_kind == "full_script")
     db.commit()
+
+    if project.active_image_provider == "local_cards":
+        # Visual cards do not use character/location bibles. Avoid a second
+        # free-tier model call that can fail or consume the remaining quota.
+        return script, [], []
 
     # 2. Extract Character Bible & Location Bible automatically via Text AI
     logger.info(f"Extracting Character & Location Bibles for project {project.id}")
@@ -240,5 +200,5 @@ OUTPUT STRICT JSON ONLY matching this format:
 
     except Exception as e:
         logger.warning(f"Failed to extract bibles automatically: {e}")
-        db.commit()
+        db.rollback()
         return script, [], []

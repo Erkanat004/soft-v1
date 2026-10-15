@@ -1,5 +1,5 @@
-from typing import List, Optional, Any, Dict
-from pydantic import BaseModel, Field
+from typing import List, Optional, Literal
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 
 # --- Project Schemas ---
@@ -12,9 +12,12 @@ class ProjectCreate(BaseModel):
     language: str = "English"
     story_type: str = "Horror"
     visual_style: str = "Cinematic"
+    creative_brief: Optional[str] = Field(default=None, max_length=4000)
     active_text_provider: Optional[str] = "gemini"
     active_image_provider: Optional[str] = "gemini_image"
     active_tts_provider: Optional[str] = "elevenlabs"
+    aspect_ratio: Literal["16:9", "9:16", "1:1"] = "16:9"
+    resolution: Literal["1080p", "720p"] = "1080p"
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
@@ -22,9 +25,16 @@ class ProjectUpdate(BaseModel):
     story_type: Optional[str] = None
     visual_style: Optional[str] = None
     global_visual_style: Optional[str] = None
+    creative_brief: Optional[str] = Field(default=None, max_length=4000)
     active_text_provider: Optional[str] = None
     active_image_provider: Optional[str] = None
     active_tts_provider: Optional[str] = None
+    aspect_ratio: Optional[Literal["16:9", "9:16", "1:1"]] = None
+    resolution: Optional[Literal["1080p", "720p"]] = None
+    default_voice_id: Optional[str] = None
+    subtitle_settings_json: Optional[str] = None
+    bg_music_path: Optional[str] = None
+    bg_music_volume: Optional[float] = None
 
 class ProjectResponse(BaseModel):
     id: str
@@ -36,6 +46,7 @@ class ProjectResponse(BaseModel):
     story_type: str
     visual_style: str
     global_visual_style: Optional[str] = None
+    creative_brief: Optional[str] = None
     status: str
     current_stage: str
     error_message: Optional[str] = None
@@ -45,11 +56,11 @@ class ProjectResponse(BaseModel):
     active_tts_provider: str
     aspect_ratio: str
     resolution: str
+    is_test_project: Optional[bool] = False
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 # --- Script Schemas ---
 
@@ -64,8 +75,7 @@ class ScriptResponse(BaseModel):
     is_user_provided: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 # --- Character & Location Schemas ---
 
@@ -87,8 +97,7 @@ class CharacterResponse(CharacterBase):
     reference_image_path: Optional[str] = None
     is_auto_generated: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class LocationBase(BaseModel):
     name: str
@@ -103,14 +112,14 @@ class LocationResponse(LocationBase):
     reference_image_path: Optional[str] = None
     is_auto_generated: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 # --- Scene Schemas ---
 
 class SceneResponse(BaseModel):
     id: int
     project_id: str
+    scene_uuid: Optional[str] = None
     scene_order: int
     narration: str
     shot_type: str
@@ -121,14 +130,23 @@ class SceneResponse(BaseModel):
     duration_target: float
     actual_duration: Optional[float] = None
     audio_path: Optional[str] = None
+    audio_offset_start: float = 0.0
+    audio_offset_end: float = 0.0
     image_path: Optional[str] = None
     video_clip_path: Optional[str] = None
     status: str
+    image_status: Optional[str] = "not_created"
+    tts_status: Optional[str] = "not_created"
+    clip_status: Optional[str] = "not_created"
+    scene_type: Optional[str] = "motion"
+    voice_id: Optional[str] = None
+    input_version: int = 1
+    image_prompt_needs_review: bool = False
+    error_message: Optional[str] = None
     character_ids_json: str
     location_id: Optional[int] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class SceneUpdate(BaseModel):
     narration: Optional[str] = None
@@ -165,8 +183,7 @@ class ProviderSettingResponse(BaseModel):
     extra_config_json: Optional[str] = "{}"
     has_api_key: bool = False  # Tells frontend key is set without revealing secret string
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 # --- Job & Progress Schemas ---
 
@@ -185,5 +202,4 @@ class JobResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
